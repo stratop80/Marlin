@@ -250,7 +250,7 @@
 
 bool Running = true;
 
-uint8_t marlin_debug_flags = DEBUG_NONE;
+uint8_t marlin_debug_flags = DEBUG_INFO | DEBUG_ERRORS | DEBUG_LEVELING;
 
 static float feedrate = 1500.0, saved_feedrate;
 float current_position[NUM_AXIS] = { 0.0 };
@@ -338,6 +338,12 @@ static uint8_t target_extruder;
   int EtoPPressure = 0;
 #endif
 
+#if ENABLED(Z_PROBE_TILT)
+  float initialx = 0;
+  float initialy = 0;
+  float initialz = 0;
+#endif
+
 #if ENABLED(FWRETRACT)
 
   bool autoretract_enabled = false;
@@ -405,12 +411,12 @@ static uint8_t target_extruder;
   float axis_scaling[3] = { 1, 1, 1 };    // Build size scaling, default to 1
 #endif
 
-#if ENABLED(FILAMENT_WIDTH_SENSOR)
+#if ENABLED(FILAMENT_SENSOR)
   //Variables for Filament Sensor input
   float filament_width_nominal = DEFAULT_NOMINAL_FILAMENT_DIA;  //Set nominal filament width, can be changed with M404
   bool filament_sensor = false;  //M405 turns on filament_sensor control, M406 turns it off
   float filament_width_meas = DEFAULT_MEASURED_FILAMENT_DIA; //Stores the measured filament diameter
-  int8_t measurement_delay[MAX_MEASUREMENT_DELAY + 1]; //ring buffer to delay measurement  store extruder factor after subtracting 100
+  signed char measurement_delay[MAX_MEASUREMENT_DELAY + 1]; //ring buffer to delay measurement  store extruder factor after subtracting 100
   int delay_index1 = 0;  //index into ring buffer
   int delay_index2 = -1;  //index into ring buffer - set to -1 on startup to indicate ring buffer needs to be initialized
   float delay_dist = 0; //delay distance counter
@@ -456,13 +462,10 @@ static bool send_ok[BUFSIZE];
   #define KEEPALIVE_STATE(n) ;
 #endif // HOST_KEEPALIVE_FEATURE
 
-/**
- * ***************************************************************************
- * ******************************** FUNCTIONS ********************************
- * ***************************************************************************
- */
+//===========================================================================
+//================================ Functions ================================
+//===========================================================================
 
-void get_available_commands();
 void process_next_command();
 
 void plan_arc(float target[NUM_AXIS], float* offset, uint8_t clockwise);
@@ -805,7 +808,7 @@ void setup() {
  *  - Call LCD update
  */
 void loop() {
-  if (commands_in_queue < BUFSIZE) get_available_commands();
+  if (commands_in_queue < BUFSIZE) get_command();
 
   #if ENABLED(SDSUPPORT)
     card.checkautostart(false);
@@ -857,36 +860,44 @@ void gcode_line_error(const char* err, bool doFlush = true) {
   serial_count = 0;
 }
 
-inline void get_serial_commands() {
+/**
+ * Add to the circular command queue the next command from:
+ *  - The command-injection queue (queued_commands_P)
+ *  - The active serial input (usually USB)
+ *  - The SD card file being actively printed
+ */
+void get_command() {
+
   static char serial_line_buffer[MAX_CMD_SIZE];
   static boolean serial_comment_mode = false;
 
-  // If the command buffer is empty for too long,
-  // send "wait" to indicate Marlin is still waiting.
+  if (drain_queued_commands_P()) return; // priority is given to non-serial commands
+
   #if defined(NO_TIMEOUTS) && NO_TIMEOUTS > 0
     static millis_t last_command_time = 0;
     millis_t ms = millis();
-    if (commands_in_queue == 0 && !MYSERIAL.available() && ms > last_command_time + NO_TIMEOUTS) {
+
+    if (!MYSERIAL.available() && commands_in_queue == 0 && ms - last_command_time > NO_TIMEOUTS) {
       SERIAL_ECHOLNPGM(MSG_WAIT);
       last_command_time = ms;
     }
   #endif
 
-  /**
-   * Loop while serial characters are incoming and the queue is not full
-   */
+  //
+  // Loop while serial characters are incoming and the queue is not full
+  //
   while (commands_in_queue < BUFSIZE && MYSERIAL.available() > 0) {
 
     char serial_char = MYSERIAL.read();
 
-    /**
-     * If the character ends the line
-     */
+    //
+    // If the character ends the line
+    //
     if (serial_char == '\n' || serial_char == '\r') {
 
       serial_comment_mode = false; // end of line == end of comment
 
-      if (!serial_count) continue; // skip empty lines
+      if (!serial_count) return; // empty lines just exit
 
       serial_line_buffer[serial_count] = 0; // terminate string
       serial_count = 0; //reset buffer
@@ -971,7 +982,7 @@ inline void get_serial_commands() {
       if (MYSERIAL.available() > 0) {
         // if we have one more character, copy it over
         serial_char = MYSERIAL.read();
-        if (!serial_comment_mode) serial_line_buffer[serial_count++] = serial_char;
+        serial_line_buffer[serial_count++] = serial_char;
       }
       // otherwise do nothing
     }
@@ -981,22 +992,17 @@ inline void get_serial_commands() {
     }
 
   } // queue has space, serial has data
-}
 
-#if ENABLED(SDSUPPORT)
+  #if ENABLED(SDSUPPORT)
 
-  inline void get_sdcard_commands() {
     static bool stop_buffering = false,
                 sd_comment_mode = false;
 
     if (!card.sdprinting) return;
 
-    /**
-     * '#' stops reading from SD to the buffer prematurely, so procedural
-     * macro calls are possible. If it occurs, stop_buffering is triggered
-     * and the buffer is run dry; this character _can_ occur in serial com
-     * due to checksums, however, no checksums are used in SD printing.
-     */
+    // '#' stops reading from SD to the buffer prematurely, so procedural macro calls are possible
+    // if it occurs, stop_buffering is triggered and the buffer is run dry.
+    // this character _can_ occur in serial com, due to checksums. however, no checksums are used in SD printing
 
     if (commands_in_queue == 0) stop_buffering = false;
 
@@ -1035,36 +1041,16 @@ inline void get_serial_commands() {
         _commit_command(false);
       }
       else if (sd_count >= MAX_CMD_SIZE - 1) {
-        /**
-         * Keep fetching, but ignore normal characters beyond the max length
-         * The command will be injected when EOL is reached
-         */
+        // Keep fetching, but ignore normal characters beyond the max length
+        // The command will be injected when EOL is reached
       }
       else {
         if (sd_char == ';') sd_comment_mode = true;
         if (!sd_comment_mode) command_queue[cmd_queue_index_w][sd_count++] = sd_char;
       }
     }
-  }
 
-#endif // SDSUPPORT
-
-/**
- * Add to the circular command queue the next command from:
- *  - The command-injection queue (queued_commands_P)
- *  - The active serial input (usually USB)
- *  - The SD card file being actively printed
- */
-void get_available_commands() {
-
-  // if any immediate commands remain, don't get other commands yet
-  if (drain_queued_commands_P()) return;
-
-  get_serial_commands();
-
-  #if ENABLED(SDSUPPORT)
-    get_sdcard_commands();
-  #endif
+  #endif // SDSUPPORT
 }
 
 bool code_has_value() {
@@ -1073,7 +1059,7 @@ bool code_has_value() {
   while (c == ' ') c = seen_pointer[++i];
   if (c == '-' || c == '+') c = seen_pointer[++i];
   if (c == '.') c = seen_pointer[++i];
-  return NUMERIC(c);
+  return (c >= '0' && c <= '9');
 }
 
 float code_value() {
@@ -1130,12 +1116,10 @@ XYZ_CONSTS_FROM_CONFIG(signed char, home_dir, HOME_DIR);
     if (extruder == 0)
       return base_home_pos(X_AXIS) + home_offset[X_AXIS];
     else
-      /**
-       * In dual carriage mode the extruder offset provides an override of the
-       * second X-carriage offset when homed - otherwise X2_HOME_POS is used.
-       * This allow soft recalibration of the second extruder offset position
-       * without firmware reflash (through the M218 command).
-       */
+      // In dual carriage mode the extruder offset provides an override of the
+      // second X-carriage offset when homed - otherwise X2_HOME_POS is used.
+      // This allow soft recalibration of the second extruder offset position without firmware reflash
+      // (through the M218 command).
       return (extruder_offset[X_AXIS][1] > 0) ? extruder_offset[X_AXIS][1] : X2_HOME_POS;
   }
 
@@ -1195,11 +1179,8 @@ static void set_axis_is_at_home(AxisEnum axis) {
 
       // SERIAL_ECHOPGM("homeposition[x]= "); SERIAL_ECHO(homeposition[0]);
       // SERIAL_ECHOPGM("homeposition[y]= "); SERIAL_ECHOLN(homeposition[1]);
-
-      /**
-       * Works out real Homeposition angles using inverse kinematics,
-       * and calculates homing offset using forward kinematics
-       */
+      // Works out real Homeposition angles using inverse kinematics,
+      // and calculates homing offset using forward kinematics
       calculate_delta(homeposition);
 
       // SERIAL_ECHOPGM("base Theta= "); SERIAL_ECHO(delta[X_AXIS]);
@@ -1219,10 +1200,8 @@ static void set_axis_is_at_home(AxisEnum axis) {
 
       current_position[axis] = delta[axis];
 
-      /**
-       * SCARA home positions are based on configuration since the actual
-       * limits are determined by the inverse kinematic transform.
-       */
+      // SCARA home positions are based on configuration since the actual limits are determined by the
+      // inverse kinematic transform.
       min_pos[axis] = base_min_pos(axis); // + (delta[axis] - base_home_pos(axis));
       max_pos[axis] = base_max_pos(axis); // + (delta[axis] - base_home_pos(axis));
     }
@@ -1238,7 +1217,7 @@ static void set_axis_is_at_home(AxisEnum axis) {
     #endif
 
     #if ENABLED(DEBUG_LEVELING_FEATURE)
-      if (DEBUGGING(LEVELING)) {
+      if (marlin_debug_flags & DEBUG_LEVELING) {
         SERIAL_ECHOPAIR("set_axis_is_at_home ", (unsigned long)axis);
         SERIAL_ECHOPAIR(" > (home_offset[axis]==", home_offset[axis]);
         print_xyz(") > current_position", current_position);
@@ -1290,7 +1269,7 @@ static void setup_for_endstop_move() {
   feedrate_multiplier = 100;
   refresh_cmd_timeout();
   #if ENABLED(DEBUG_LEVELING_FEATURE)
-    if (DEBUGGING(LEVELING)) {
+    if (marlin_debug_flags & DEBUG_LEVELING) {
       SERIAL_ECHOLNPGM("setup_for_endstop_move > enable_endstops(true)");
     }
   #endif
@@ -1305,7 +1284,7 @@ static void setup_for_endstop_move() {
      */
     void prepare_move_raw() {
       #if ENABLED(DEBUG_LEVELING_FEATURE)
-        if (DEBUGGING(LEVELING)) {
+        if (marlin_debug_flags & DEBUG_LEVELING) {
           print_xyz("prepare_move_raw > destination", destination);
         }
       #endif
@@ -1337,7 +1316,7 @@ static void setup_for_endstop_move() {
         current_position[Z_AXIS] = corrected_position.z;
 
         #if ENABLED(DEBUG_LEVELING_FEATURE)
-          if (DEBUGGING(LEVELING)) {
+          if (marlin_debug_flags & DEBUG_LEVELING) {
             print_xyz("set_bed_level_equation_lsq > current_position", current_position);
           }
         #endif
@@ -1372,7 +1351,7 @@ static void setup_for_endstop_move() {
       current_position[Z_AXIS] = corrected_position.z;
 
       #if ENABLED(DEBUG_LEVELING_FEATURE)
-        if (DEBUGGING(LEVELING)) {
+        if (marlin_debug_flags & DEBUG_LEVELING) {
           print_xyz("set_bed_level_equation_3pts > current_position", current_position);
         }
       #endif
@@ -1384,11 +1363,7 @@ static void setup_for_endstop_move() {
 
   static void run_z_probe() {
 
-    /**
-     * To prevent stepper_inactive_time from running out and
-     * EXTRUDER_RUNOUT_PREVENT from extruding
-     */
-    refresh_cmd_timeout();
+    refresh_cmd_timeout(); // to prevent stepper_inactive_time from running out and EXTRUDER_RUNOUT_PREVENT from extruding
 
     #if ENABLED(DELTA)
 
@@ -1396,7 +1371,7 @@ static void setup_for_endstop_move() {
       long start_steps = st_get_position(Z_AXIS);
 
       #if ENABLED(DEBUG_LEVELING_FEATURE)
-        if (DEBUGGING(LEVELING)) {
+        if (marlin_debug_flags & DEBUG_LEVELING) {
           SERIAL_ECHOLNPGM("run_z_probe (DELTA) 1");
         }
       #endif
@@ -1408,16 +1383,13 @@ static void setup_for_endstop_move() {
       st_synchronize();
       endstops_hit_on_purpose(); // clear endstop hit flags
 
-      /**
-       * We have to let the planner know where we are right now as it
-       * is not where we said to go.
-       */
+      // we have to let the planner know where we are right now as it is not where we said to go.
       long stop_steps = st_get_position(Z_AXIS);
       float mm = start_z - float(start_steps - stop_steps) / axis_steps_per_unit[Z_AXIS];
       current_position[Z_AXIS] = mm;
 
       #if ENABLED(DEBUG_LEVELING_FEATURE)
-        if (DEBUGGING(LEVELING)) {
+        if (marlin_debug_flags & DEBUG_LEVELING) {
           print_xyz("run_z_probe (DELTA) 2 > current_position", current_position);
         }
       #endif
@@ -1436,10 +1408,7 @@ static void setup_for_endstop_move() {
 
       // Tell the planner where we ended up - Get this from the stepper handler
       zPosition = st_get_axis_position_mm(Z_AXIS);
-      plan_set_position(
-        current_position[X_AXIS], current_position[Y_AXIS], zPosition,
-        current_position[E_AXIS]
-      );
+      plan_set_position(current_position[X_AXIS], current_position[Y_AXIS], zPosition, current_position[E_AXIS]);
 
       // move up the retract distance
       zPosition += home_bump_mm(Z_AXIS);
@@ -1460,7 +1429,7 @@ static void setup_for_endstop_move() {
       sync_plan_position();
 
       #if ENABLED(DEBUG_LEVELING_FEATURE)
-        if (DEBUGGING(LEVELING)) {
+        if (marlin_debug_flags & DEBUG_LEVELING) {
           print_xyz("run_z_probe > current_position", current_position);
         }
       #endif
@@ -1476,7 +1445,7 @@ static void setup_for_endstop_move() {
     float oldFeedRate = feedrate;
 
     #if ENABLED(DEBUG_LEVELING_FEATURE)
-      if (DEBUGGING(LEVELING)) {
+      if (marlin_debug_flags & DEBUG_LEVELING) {
         print_xyz("do_blocking_move_to", x, y, z);
       }
     #endif
@@ -1511,25 +1480,14 @@ static void setup_for_endstop_move() {
     feedrate = oldFeedRate;
   }
 
-  inline void do_blocking_move_to_xy(float x, float y) {
-    do_blocking_move_to(x, y, current_position[Z_AXIS]);
-  }
-
-  inline void do_blocking_move_to_x(float x) {
-    do_blocking_move_to(x, current_position[Y_AXIS], current_position[Z_AXIS]);
-  }
-
-  inline void do_blocking_move_to_z(float z) {
-    do_blocking_move_to(current_position[X_AXIS], current_position[Y_AXIS], z);
-  }
-
-  inline void raise_z_after_probing() {
-    do_blocking_move_to_z(current_position[Z_AXIS] + Z_RAISE_AFTER_PROBING);
-  }
+  inline void do_blocking_move_to_xy(float x, float y) { do_blocking_move_to(x, y, current_position[Z_AXIS]); }
+  inline void do_blocking_move_to_x(float x) { do_blocking_move_to(x, current_position[Y_AXIS], current_position[Z_AXIS]); }
+  inline void do_blocking_move_to_z(float z) { do_blocking_move_to(current_position[X_AXIS], current_position[Y_AXIS], z); }
+  inline void raise_z_after_probing() { do_blocking_move_to_z(current_position[Z_AXIS] + Z_RAISE_AFTER_PROBING); }
 
   static void clean_up_after_endstop_move() {
     #if ENABLED(DEBUG_LEVELING_FEATURE)
-      if (DEBUGGING(LEVELING)) {
+      if (marlin_debug_flags & DEBUG_LEVELING) {
         SERIAL_ECHOLNPGM("clean_up_after_endstop_move > ENDSTOPS_ONLY_FOR_HOMING > endstops_not_homing()");
       }
     #endif
@@ -1542,13 +1500,12 @@ static void setup_for_endstop_move() {
   #if ENABLED(HAS_Z_MIN_PROBE)
 
   static void deploy_z_probe() {
-
+    
     #if ENABLED(DEBUG_LEVELING_FEATURE)
-      if (DEBUGGING(LEVELING)) {
+      if (marlin_debug_flags & DEBUG_LEVELING) {
         print_xyz("deploy_z_probe > current_position", current_position);
       }
     #endif
-
     if (z_probe_is_active) return;
 
     #if HAS_SERVO_ENDSTOPS
@@ -1556,6 +1513,57 @@ static void setup_for_endstop_move() {
       // Engage Z Servo endstop if enabled
       if (servo_endstop_id[Z_AXIS] >= 0) servo[servo_endstop_id[Z_AXIS]].move(servo_endstop_angle[Z_AXIS][0]);
 
+    #elif ENABLED(Z_PROBE_TILT)
+
+     feedrate = XY_TRAVEL_SPEED;
+
+      // If endstop is already false, the Z probe is deployed
+     
+      #if ENABLED(Z_MIN_PROBE_ENDSTOP)
+        bool z_probe_endstop = (READ(Z_MIN_PROBE_PIN) != Z_MIN_PROBE_ENDSTOP_INVERTING);
+        if (z_probe_endstop)
+      #else
+        bool z_min_endstop = (READ(Z_MIN_PIN) != Z_MIN_ENDSTOP_INVERTING);
+        if (z_min_endstop)
+      #endif
+    
+
+      // Move to the start position to initiate deployment
+      feedrate = XY_TRAVEL_SPEED;
+      destination[X_AXIS] = Z_PROBE_TILT_DEPLOY_1_X-X_PROBE_OFFSET_FROM_EXTRUDER;
+      destination[Y_AXIS] = Z_PROBE_TILT_DEPLOY_1_Y-Y_PROBE_OFFSET_FROM_EXTRUDER;
+      destination[Z_AXIS] = Z_PROBE_TILT_DEPLOY_1_Z;
+      prepare_move(); // this will also set_current_to_destination
+      //st_synchronize();
+
+      // Move to trigger deployment
+      feedrate = XY_TRAVEL_SPEED;
+      if (Z_PROBE_TILT_DEPLOY_2_X != Z_PROBE_TILT_DEPLOY_1_X)
+        destination[X_AXIS] = Z_PROBE_TILT_DEPLOY_2_X;
+      if (Z_PROBE_TILT_DEPLOY_2_Y != Z_PROBE_TILT_DEPLOY_1_Y)
+        destination[Y_AXIS] = Z_PROBE_TILT_DEPLOY_2_Y;
+      if (Z_PROBE_TILT_DEPLOY_2_Z != Z_PROBE_TILT_DEPLOY_1_Z)
+        destination[Z_AXIS] = Z_PROBE_TILT_DEPLOY_2_Z;
+      prepare_move();
+     // st_synchronize();
+ 
+      #if ENABLED(Z_MIN_PROBE_ENDSTOP)
+        z_probe_endstop = (READ(Z_MIN_PROBE_PIN) != Z_MIN_PROBE_ENDSTOP_INVERTING);
+        if (z_probe_endstop)
+      #else
+        z_min_endstop = (READ(Z_MIN_PIN) != Z_MIN_ENDSTOP_INVERTING);
+        if (z_min_endstop)
+      #endif
+        {
+          if (IsRunning()) {
+            SERIAL_ERROR_START;
+            SERIAL_ERRORLNPGM("Z-Probe failed to engage!");
+            LCD_ALERTMESSAGEPGM("Err: ZPROBE");
+          }
+          Stop();
+        }
+
+    
     #elif ENABLED(Z_PROBE_ALLEN_KEY)
       feedrate = Z_PROBE_ALLEN_KEY_DEPLOY_1_FEEDRATE;
 
@@ -1639,13 +1647,12 @@ static void setup_for_endstop_move() {
 
   static void stow_z_probe(bool doRaise = true) {
     #if ENABLED(DEBUG_LEVELING_FEATURE)
-      if (DEBUGGING(LEVELING)) {
+      if (marlin_debug_flags & DEBUG_LEVELING) {
         print_xyz("stow_z_probe > current_position", current_position);
       }
     #endif
-
+    
     if (!z_probe_is_active) return;
-
     #if HAS_SERVO_ENDSTOPS
 
       // Retract Z Servo endstop if enabled
@@ -1654,7 +1661,7 @@ static void setup_for_endstop_move() {
         #if Z_RAISE_AFTER_PROBING > 0
           if (doRaise) {
             #if ENABLED(DEBUG_LEVELING_FEATURE)
-              if (DEBUGGING(LEVELING)) {
+              if (marlin_debug_flags & DEBUG_LEVELING) {
                 SERIAL_ECHOPAIR("Raise Z (after) by ", (float)Z_RAISE_AFTER_PROBING);
                 SERIAL_EOL;
                 SERIAL_ECHO("> SERVO_ENDSTOPS > raise_z_after_probing()");
@@ -1668,6 +1675,46 @@ static void setup_for_endstop_move() {
 
         // Change the Z servo angle
         servo[servo_endstop_id[Z_AXIS]].move(servo_endstop_angle[Z_AXIS][1]);
+      }
+
+    #elif ENABLED(Z_PROBE_TILT)
+      {
+        
+
+        // Move to the homing position to initiate retraction
+      feedrate = XY_TRAVEL_SPEED;
+      destination[X_AXIS] = Z_PROBE_TILT_STOW_1_X-X_PROBE_OFFSET_FROM_EXTRUDER;
+      destination[Y_AXIS] = Z_PROBE_TILT_STOW_1_Y-Y_PROBE_OFFSET_FROM_EXTRUDER;
+      destination[Z_AXIS] = Z_PROBE_TILT_STOW_1_Z-Z_PROBE_OFFSET_FROM_EXTRUDER;
+      prepare_move();
+      st_synchronize();
+
+
+      // Move the nozzle up to twist the Z probe into retracted position
+     feedrate = XY_TRAVEL_SPEED; 
+      if (Z_PROBE_TILT_STOW_2_X != Z_PROBE_TILT_STOW_1_X)
+        destination[X_AXIS] = Z_PROBE_TILT_STOW_2_X;
+      if (Z_PROBE_TILT_STOW_2_Y != Z_PROBE_TILT_STOW_1_Y)
+        destination[Y_AXIS] = Z_PROBE_TILT_STOW_2_Y;
+      destination[Z_AXIS] = Z_PROBE_TILT_STOW_2_Z;
+      prepare_move();
+      st_synchronize();
+
+      #if ENABLED(Z_MIN_PROBE_ENDSTOP)
+        bool z_probe_endstop = (READ(Z_MIN_PROBE_PIN) != Z_MIN_PROBE_ENDSTOP_INVERTING);
+        if (z_probe_endstop)
+      #else
+        bool z_min_endstop = (READ(Z_MIN_PIN) != Z_MIN_ENDSTOP_INVERTING);
+        if (z_min_endstop)
+      #endif
+        {
+          if (IsRunning()) {
+            SERIAL_ERROR_START;
+            SERIAL_ERRORLNPGM("Z-Probe failed to retract!");
+            LCD_ALERTMESSAGEPGM("Err: ZPROBE");
+          }
+          Stop();
+        }
       }
 
     #elif ENABLED(Z_PROBE_ALLEN_KEY)
@@ -1749,7 +1796,7 @@ static void setup_for_endstop_move() {
   // Probe bed height at position (x,y), returns the measured z value
   static float probe_pt(float x, float y, float z_before, ProbeAction probe_action = ProbeDeployAndStow, int verbose_level = 1) {
     #if ENABLED(DEBUG_LEVELING_FEATURE)
-      if (DEBUGGING(LEVELING)) {
+      if (marlin_debug_flags & DEBUG_LEVELING) {
         SERIAL_ECHOLNPGM("probe_pt >>>");
         SERIAL_ECHOPAIR("> ProbeAction:", (unsigned long)probe_action);
         SERIAL_EOL;
@@ -1758,7 +1805,7 @@ static void setup_for_endstop_move() {
     #endif
 
     #if ENABLED(DEBUG_LEVELING_FEATURE)
-      if (DEBUGGING(LEVELING)) {
+      if (marlin_debug_flags & DEBUG_LEVELING) {
         SERIAL_ECHOPAIR("Z Raise to z_before ", z_before);
         SERIAL_EOL;
         SERIAL_ECHOPAIR("> do_blocking_move_to_z ", z_before);
@@ -1770,20 +1817,19 @@ static void setup_for_endstop_move() {
     do_blocking_move_to_z(z_before); // this also updates current_position
 
     #if ENABLED(DEBUG_LEVELING_FEATURE)
-      if (DEBUGGING(LEVELING)) {
+      if (marlin_debug_flags & DEBUG_LEVELING) {
         SERIAL_ECHOPAIR("> do_blocking_move_to_xy ", x - (X_PROBE_OFFSET_FROM_EXTRUDER));
         SERIAL_ECHOPAIR(", ", y - (Y_PROBE_OFFSET_FROM_EXTRUDER));
         SERIAL_EOL;
       }
     #endif
 
-    // this also updates current_position
-    do_blocking_move_to_xy(x - (X_PROBE_OFFSET_FROM_EXTRUDER), y - (Y_PROBE_OFFSET_FROM_EXTRUDER));
+    do_blocking_move_to_xy(x - (X_PROBE_OFFSET_FROM_EXTRUDER), y - (Y_PROBE_OFFSET_FROM_EXTRUDER)); // this also updates current_position
 
-    #if DISABLED(Z_PROBE_SLED) && DISABLED(Z_PROBE_ALLEN_KEY)
+    #if DISABLED(Z_PROBE_SLED) && DISABLED(Z_PROBE_ALLEN_KEY) 
       if (probe_action & ProbeDeploy) {
         #if ENABLED(DEBUG_LEVELING_FEATURE)
-          if (DEBUGGING(LEVELING)) {
+          if (marlin_debug_flags & DEBUG_LEVELING) {
             SERIAL_ECHOLNPGM("> ProbeDeploy");
           }
         #endif
@@ -1794,10 +1840,10 @@ static void setup_for_endstop_move() {
     run_z_probe();
     float measured_z = current_position[Z_AXIS];
 
-    #if DISABLED(Z_PROBE_SLED) && DISABLED(Z_PROBE_ALLEN_KEY)
+    #if DISABLED(Z_PROBE_SLED) && DISABLED(Z_PROBE_ALLEN_KEY) 
       if (probe_action & ProbeStow) {
         #if ENABLED(DEBUG_LEVELING_FEATURE)
-          if (DEBUGGING(LEVELING)) {
+          if (marlin_debug_flags & DEBUG_LEVELING) {
             SERIAL_ECHOLNPGM("> ProbeStow (stow_z_probe will do Z Raise)");
           }
         #endif
@@ -1816,7 +1862,7 @@ static void setup_for_endstop_move() {
     }
 
     #if ENABLED(DEBUG_LEVELING_FEATURE)
-      if (DEBUGGING(LEVELING)) {
+      if (marlin_debug_flags & DEBUG_LEVELING) {
         SERIAL_ECHOLNPGM("<<< probe_pt");
       }
     #endif
@@ -1829,6 +1875,7 @@ static void setup_for_endstop_move() {
     /**
      * All DELTA leveling in the Marlin uses NONLINEAR_BED_LEVELING
      */
+
     static void extrapolate_one_point(int x, int y, int xdir, int ydir) {
       if (bed_level[x][y] != 0.0) {
         return;  // Don't overwrite good values.
@@ -1848,10 +1895,8 @@ static void setup_for_endstop_move() {
       bed_level[x][y] = median;
     }
 
-    /**
-     * Fill in the unprobed points (corners of circular print surface)
-     * using linear extrapolation, away from the center.
-     */
+    // Fill in the unprobed points (corners of circular print surface)
+    // using linear extrapolation, away from the center.
     static void extrapolate_unprobed_bed_level() {
       int half = (AUTO_BED_LEVELING_GRID_POINTS - 1) / 2;
       for (int y = 0; y <= half; y++) {
@@ -1865,9 +1910,7 @@ static void setup_for_endstop_move() {
       }
     }
 
-    /**
-     * Print calibration results for plotting or manual frame adjustment.
-     */
+    // Print calibration results for plotting or manual frame adjustment.
     static void print_bed_level() {
       for (int y = 0; y < AUTO_BED_LEVELING_GRID_POINTS; y++) {
         for (int x = 0; x < AUTO_BED_LEVELING_GRID_POINTS; x++) {
@@ -1878,12 +1921,10 @@ static void setup_for_endstop_move() {
       }
     }
 
-    /**
-     * Reset calibration results to zero.
-     */
+    // Reset calibration results to zero.
     void reset_bed_level() {
       #if ENABLED(DEBUG_LEVELING_FEATURE)
-        if (DEBUGGING(LEVELING)) {
+        if (marlin_debug_flags & DEBUG_LEVELING) {
           SERIAL_ECHOLNPGM("reset_bed_level");
         }
       #endif
@@ -1900,11 +1941,9 @@ static void setup_for_endstop_move() {
 
     void raise_z_for_servo() {
       float zpos = current_position[Z_AXIS], z_dest = Z_RAISE_BEFORE_PROBING;
-      /**
-       * The zprobe_zoffset is negative any switch below the nozzle, so
-       * multiply by Z_HOME_DIR (-1) to move enough away from bed for the probe
-       */
-      z_dest += axis_homed[Z_AXIS] ? zprobe_zoffset * Z_HOME_DIR : zpos;
+      // The zprobe_zoffset is negative any switch below the nozzle, so
+      // multiply by Z_HOME_DIR (-1) to move enough away from bed for the probe
+      z_dest += axis_known_position[Z_AXIS] ? zprobe_zoffset * Z_HOME_DIR : zpos;
       if (zpos < z_dest) do_blocking_move_to_z(z_dest); // also updates current_position
     }
 
@@ -1912,10 +1951,10 @@ static void setup_for_endstop_move() {
 
 #endif // AUTO_BED_LEVELING_FEATURE
 
-static void axis_unhomed_error() {
-  LCD_MESSAGEPGM(MSG_YX_UNHOMED);
+static void unknown_position_error() {
+  LCD_MESSAGEPGM(MSG_POSITION_UNKNOWN);
   SERIAL_ECHO_START;
-  SERIAL_ECHOLNPGM(MSG_YX_UNHOMED);
+  SERIAL_ECHOLNPGM(MSG_POSITION_UNKNOWN);
 }
 
 #if ENABLED(Z_PROBE_SLED)
@@ -1932,7 +1971,7 @@ static void axis_unhomed_error() {
    */
   static void dock_sled(bool dock, int offset = 0) {
     #if ENABLED(DEBUG_LEVELING_FEATURE)
-      if (DEBUGGING(LEVELING)) {
+      if (marlin_debug_flags & DEBUG_LEVELING) {
         SERIAL_ECHOPAIR("dock_sled", dock);
         SERIAL_EOL;
       }
@@ -1940,8 +1979,8 @@ static void axis_unhomed_error() {
 
     if (z_probe_is_active == dock) return;
 
-    if (!axis_homed[X_AXIS] || !axis_homed[Y_AXIS]) {
-      axis_unhomed_error();
+    if (!axis_known_position[X_AXIS] || !axis_known_position[Y_AXIS]) {
+      unknown_position_error();
       return;
     }
 
@@ -1950,8 +1989,7 @@ static void axis_unhomed_error() {
       #if Z_RAISE_AFTER_PROBING > 0
         raise_z_after_probing(); // raise Z
       #endif
-      // Dock sled a bit closer to ensure proper capturing
-      do_blocking_move_to_x(X_MAX_POS + SLED_DOCKING_OFFSET + offset - 1);
+      do_blocking_move_to_x(X_MAX_POS + SLED_DOCKING_OFFSET + offset - 1);  // Dock sled a bit closer to ensure proper capturing
       digitalWrite(SLED_PIN, LOW); // turn off magnet
     }
     else {
@@ -1977,7 +2015,7 @@ static void axis_unhomed_error() {
 
 static void homeaxis(AxisEnum axis) {
   #if ENABLED(DEBUG_LEVELING_FEATURE)
-    if (DEBUGGING(LEVELING)) {
+    if (marlin_debug_flags & DEBUG_LEVELING) {
       SERIAL_ECHOPAIR(">>> homeaxis(", (unsigned long)axis);
       SERIAL_CHAR(')');
       SERIAL_EOL;
@@ -1999,33 +2037,31 @@ static void homeaxis(AxisEnum axis) {
     sync_plan_position();
 
     #if ENABLED(Z_PROBE_SLED)
-      #define _Z_SERVO_TEST       (axis != Z_AXIS)      // deploy Z, servo.move XY
-      #define _Z_PROBE_SUBTEST    false                 // Z will never be invoked
-      #define _Z_DEPLOY           (dock_sled(false))
-      #define _Z_STOW             (dock_sled(true))
+      // Get Probe
+      if (axis == Z_AXIS) {
+        if (axis_home_dir < 0) dock_sled(false);
+      }
+
+     #elif ENABLED(Z_PROBE_TILT)    
+      // Active probe status
+      if (axis == Z_AXIS) {
+        if (axis_home_dir < 0) z_probe_is_active = true;
+      }
+   
     #elif SERVO_LEVELING || ENABLED(FIX_MOUNTED_PROBE)
-      #define _Z_SERVO_TEST       (axis != Z_AXIS)      // servo.move XY
-      #define _Z_PROBE_SUBTEST    false                 // Z will never be invoked
-      #define _Z_DEPLOY           (deploy_z_probe())
-      #define _Z_STOW             (stow_z_probe())
-    #elif HAS_SERVO_ENDSTOPS
-      #define _Z_SERVO_TEST       true                  // servo.move X, Y, Z
-      #define _Z_PROBE_SUBTEST    (axis == Z_AXIS)      // Z is a probe
+
+      // Deploy a Z probe if there is one, and homing towards the bed
+      if (axis == Z_AXIS) {
+        if (axis_home_dir < 0) deploy_z_probe();
+      }
+
     #endif
 
-    if (axis == Z_AXIS) {
-      // If there's a Z probe that needs deployment...
-      #if ENABLED(Z_PROBE_SLED) || SERVO_LEVELING || ENABLED(FIX_MOUNTED_PROBE)
-        // ...and homing Z towards the bed? Deploy it.
-        if (axis_home_dir < 0) _Z_DEPLOY;
-      #endif
-    }
-
     #if HAS_SERVO_ENDSTOPS
-      // Engage an X or Y Servo endstop if enabled
-      if (_Z_SERVO_TEST && servo_endstop_id[axis] >= 0) {
+      // Engage Servo endstop if enabled
+      if (axis != Z_AXIS && servo_endstop_id[axis] >= 0) {
         servo[servo_endstop_id[axis]].move(servo_endstop_angle[axis][0]);
-        if (_Z_PROBE_SUBTEST) z_probe_is_active = true;
+        z_probe_is_active = true;
       }
     #endif
 
@@ -2045,7 +2081,7 @@ static void homeaxis(AxisEnum axis) {
     sync_plan_position();
 
     #if ENABLED(DEBUG_LEVELING_FEATURE)
-      if (DEBUGGING(LEVELING)) {
+      if (marlin_debug_flags & DEBUG_LEVELING) {
         SERIAL_ECHOLNPGM("> enable_endstops(false)");
       }
     #endif
@@ -2057,7 +2093,7 @@ static void homeaxis(AxisEnum axis) {
     st_synchronize();
 
     #if ENABLED(DEBUG_LEVELING_FEATURE)
-      if (DEBUGGING(LEVELING)) {
+      if (marlin_debug_flags & DEBUG_LEVELING) {
         SERIAL_ECHOLNPGM("> enable_endstops(true)");
       }
     #endif
@@ -2072,7 +2108,7 @@ static void homeaxis(AxisEnum axis) {
     st_synchronize();
 
     #if ENABLED(DEBUG_LEVELING_FEATURE)
-      if (DEBUGGING(LEVELING)) {
+      if (marlin_debug_flags & DEBUG_LEVELING) {
         print_xyz("> TRIGGER ENDSTOP > current_position", current_position);
       }
     #endif
@@ -2106,7 +2142,7 @@ static void homeaxis(AxisEnum axis) {
       // retrace by the amount specified in endstop_adj
       if (endstop_adj[axis] * axis_home_dir < 0) {
         #if ENABLED(DEBUG_LEVELING_FEATURE)
-          if (DEBUGGING(LEVELING)) {
+          if (marlin_debug_flags & DEBUG_LEVELING) {
             SERIAL_ECHOLNPGM("> enable_endstops(false)");
           }
         #endif
@@ -2114,7 +2150,7 @@ static void homeaxis(AxisEnum axis) {
         sync_plan_position();
         destination[axis] = endstop_adj[axis];
         #if ENABLED(DEBUG_LEVELING_FEATURE)
-          if (DEBUGGING(LEVELING)) {
+          if (marlin_debug_flags & DEBUG_LEVELING) {
             SERIAL_ECHOPAIR("> endstop_adj = ", endstop_adj[axis]);
             print_xyz(" > destination", destination);
           }
@@ -2122,7 +2158,7 @@ static void homeaxis(AxisEnum axis) {
         line_to_destination();
         st_synchronize();
         #if ENABLED(DEBUG_LEVELING_FEATURE)
-          if (DEBUGGING(LEVELING)) {
+          if (marlin_debug_flags & DEBUG_LEVELING) {
             SERIAL_ECHOLNPGM("> enable_endstops(true)");
           }
         #endif
@@ -2130,7 +2166,7 @@ static void homeaxis(AxisEnum axis) {
       }
       #if ENABLED(DEBUG_LEVELING_FEATURE)
         else {
-          if (DEBUGGING(LEVELING)) {
+          if (marlin_debug_flags & DEBUG_LEVELING) {
             SERIAL_ECHOPAIR("> endstop_adj * axis_home_dir = ", endstop_adj[axis] * axis_home_dir);
             SERIAL_EOL;
           }
@@ -2143,7 +2179,7 @@ static void homeaxis(AxisEnum axis) {
     sync_plan_position();
 
     #if ENABLED(DEBUG_LEVELING_FEATURE)
-      if (DEBUGGING(LEVELING)) {
+      if (marlin_debug_flags & DEBUG_LEVELING) {
         print_xyz("> AFTER set_axis_is_at_home > current_position", current_position);
       }
     #endif
@@ -2154,35 +2190,49 @@ static void homeaxis(AxisEnum axis) {
     axis_known_position[axis] = true;
     axis_homed[axis] = true;
 
-    // Put away the Z probe
-    #if ENABLED(Z_PROBE_SLED) || SERVO_LEVELING || ENABLED(FIX_MOUNTED_PROBE)
-      if (axis == Z_AXIS && axis_home_dir < 0) {
-        #if ENABLED(DEBUG_LEVELING_FEATURE)
-          if (DEBUGGING(LEVELING)) {
-            SERIAL_ECHOLNPGM("> SERVO_LEVELING > " STRINGIFY(_Z_STOW));
-          }
-        #endif
-        _Z_STOW;
+    #if ENABLED(Z_PROBE_SLED)
+      // bring Z probe back
+      if (axis == Z_AXIS) {
+        if (axis_home_dir < 0) dock_sled(true);
       }
+
+     
+    #elif SERVO_LEVELING || ENABLED(FIX_MOUNTED_PROBE)
+
+      // Deploy a Z probe if there is one, and homing towards the bed
+      if (axis == Z_AXIS) {
+        if (axis_home_dir < 0) {
+          #if ENABLED(DEBUG_LEVELING_FEATURE)
+            if (marlin_debug_flags & DEBUG_LEVELING) {
+              SERIAL_ECHOLNPGM("> SERVO_LEVELING > stow_z_probe");
+            }
+          #endif
+          stow_z_probe();
+        }
+      }
+      else
+
     #endif
 
-    // Retract Servo endstop if enabled
-    #if HAS_SERVO_ENDSTOPS
-      if (_Z_SERVO_TEST && servo_endstop_id[axis] >= 0) {
-        #if ENABLED(DEBUG_LEVELING_FEATURE)
-          if (DEBUGGING(LEVELING)) {
-            SERIAL_ECHOLNPGM("> SERVO_ENDSTOPS > Stow with servo.move()");
-          }
-        #endif
-        servo[servo_endstop_id[axis]].move(servo_endstop_angle[axis][1]);
-        if (_Z_PROBE_SUBTEST) z_probe_is_active = false;
-      }
-    #endif
+    {
+      #if HAS_SERVO_ENDSTOPS
+        // Retract Servo endstop if enabled
+        if (servo_endstop_id[axis] >= 0) {
+          #if ENABLED(DEBUG_LEVELING_FEATURE)
+            if (marlin_debug_flags & DEBUG_LEVELING) {
+              SERIAL_ECHOLNPGM("> SERVO_ENDSTOPS > Stow with servo.move()");
+            }
+          #endif
+          servo[servo_endstop_id[axis]].move(servo_endstop_angle[axis][1]);
+          z_probe_is_active = false;
+        }
+      #endif
+    }
 
   }
 
   #if ENABLED(DEBUG_LEVELING_FEATURE)
-    if (DEBUGGING(LEVELING)) {
+    if (marlin_debug_flags & DEBUG_LEVELING) {
       SERIAL_ECHOPAIR("<<< homeaxis(", (unsigned long)axis);
       SERIAL_CHAR(')');
       SERIAL_EOL;
@@ -2244,9 +2294,9 @@ static void homeaxis(AxisEnum axis) {
 #endif // FWRETRACT
 
 /**
- * ***************************************************************************
- * ***************************** G-CODE HANDLING *****************************
- * ***************************************************************************
+ *
+ * G-Code Handler functions
+ *
  */
 
 /**
@@ -2278,15 +2328,13 @@ void unknown_command_error() {
 
 #if ENABLED(HOST_KEEPALIVE_FEATURE)
 
-  /**
-   * Output a "busy" message at regular intervals
-   * while the machine is not accepting commands.
-   */
   void host_keepalive() {
     millis_t ms = millis();
     if (busy_state != NOT_BUSY) {
       if (ms < next_busy_signal_ms) return;
       switch (busy_state) {
+        case NOT_BUSY:
+          break;
         case IN_HANDLER:
         case IN_PROCESS:
           SERIAL_ECHO_START;
@@ -2302,7 +2350,7 @@ void unknown_command_error() {
           break;
       }
     }
-    next_busy_signal_ms = ms + 10000UL; // "busy: ..." message every 10s
+    next_busy_signal_ms = ms + 2000UL;
   }
 
 #endif //HOST_KEEPALIVE_FEATURE
@@ -2421,7 +2469,7 @@ inline void gcode_G4() {
 inline void gcode_G28() {
 
   #if ENABLED(DEBUG_LEVELING_FEATURE)
-    if (DEBUGGING(LEVELING)) {
+    if (marlin_debug_flags & DEBUG_LEVELING) {
       SERIAL_ECHOLNPGM("gcode_G28 >>>");
     }
   #endif
@@ -2437,10 +2485,7 @@ inline void gcode_G28() {
     #endif
   #endif
 
-  /**
-   * For mesh bed leveling deactivate the mesh calculations, will be turned
-   * on again when homing all axis
-   */
+  // For manual bed leveling deactivate the matrix temporarily
   #if ENABLED(MESH_BED_LEVELING)
     uint8_t mbl_was_active = mbl.active;
     mbl.active = 0;
@@ -2448,19 +2493,13 @@ inline void gcode_G28() {
 
   setup_for_endstop_move();
 
-  /**
-   * Directly after a reset this is all 0. Later we get a hint if we have
-   * to raise z or not.
-   */
-  set_destination_to_current();
+  set_destination_to_current(); // Directly after a reset this is all 0. Later we get a hint if we have to raise z or not.
 
   feedrate = 0.0;
 
   #if ENABLED(DELTA)
-    /**
-     * A delta can only safely home all axis at the same time
-     * all axis have to home at the same time
-     */
+    // A delta can only safely home all axis at the same time
+    // all axis have to home at the same time
 
     // Pretend the current position is 0,0,0
     for (int i = X_AXIS; i <= Z_AXIS; i++) current_position[i] = 0;
@@ -2484,7 +2523,7 @@ inline void gcode_G28() {
     sync_plan_position_delta();
 
     #if ENABLED(DEBUG_LEVELING_FEATURE)
-      if (DEBUGGING(LEVELING)) {
+      if (marlin_debug_flags & DEBUG_LEVELING) {
         print_xyz("(DELTA) > current_position", current_position);
       }
     #endif
@@ -2502,7 +2541,7 @@ inline void gcode_G28() {
       if (home_all_axis || homeZ) {
         HOMEAXIS(Z);
         #if ENABLED(DEBUG_LEVELING_FEATURE)
-          if (DEBUGGING(LEVELING)) {
+          if (marlin_debug_flags & DEBUG_LEVELING) {
             print_xyz("> HOMEAXIS(Z) > current_position", current_position);
           }
         #endif
@@ -2515,7 +2554,7 @@ inline void gcode_G28() {
         destination[Z_AXIS] = MIN_Z_HEIGHT_FOR_HOMING;
         feedrate = max_feedrate[Z_AXIS] * 60;  // feedrate (mm/m) = max_feedrate (mm/s)
         #if ENABLED(DEBUG_LEVELING_FEATURE)
-          if (DEBUGGING(LEVELING)) {
+          if (marlin_debug_flags & DEBUG_LEVELING) {
             SERIAL_ECHOPAIR("Raise Z (before homing) to ", (float)(MIN_Z_HEIGHT_FOR_HOMING));
             SERIAL_EOL;
             print_xyz("> (home_all_axis || homeZ) > current_position", current_position);
@@ -2525,11 +2564,9 @@ inline void gcode_G28() {
         line_to_destination();
         st_synchronize();
 
-        /**
-         * Update the current Z position even if it currently not real from
-         * Z-home otherwise each call to line_to_destination() will want to
-         * move Z-axis by MIN_Z_HEIGHT_FOR_HOMING.
-         */
+        // Update the current Z position even if it currently not real from Z-home
+        // otherwise each call to line_to_destination() will want to move Z-axis
+        // by MIN_Z_HEIGHT_FOR_HOMING.
         current_position[Z_AXIS] = destination[Z_AXIS];
       }
     #endif
@@ -2563,7 +2600,7 @@ inline void gcode_G28() {
         sync_plan_position();
 
         #if ENABLED(DEBUG_LEVELING_FEATURE)
-          if (DEBUGGING(LEVELING)) {
+          if (marlin_debug_flags & DEBUG_LEVELING) {
             print_xyz("> QUICK_HOME > current_position 1", current_position);
           }
         #endif
@@ -2582,7 +2619,7 @@ inline void gcode_G28() {
         #endif
 
         #if ENABLED(DEBUG_LEVELING_FEATURE)
-          if (DEBUGGING(LEVELING)) {
+          if (marlin_debug_flags & DEBUG_LEVELING) {
             print_xyz("> QUICK_HOME > current_position 2", current_position);
           }
         #endif
@@ -2613,7 +2650,7 @@ inline void gcode_G28() {
         HOMEAXIS(X);
       #endif
       #if ENABLED(DEBUG_LEVELING_FEATURE)
-        if (DEBUGGING(LEVELING)) {
+        if (marlin_debug_flags & DEBUG_LEVELING) {
           print_xyz("> homeX", current_position);
         }
       #endif
@@ -2624,7 +2661,7 @@ inline void gcode_G28() {
       if (home_all_axis || homeY) {
         HOMEAXIS(Y);
         #if ENABLED(DEBUG_LEVELING_FEATURE)
-          if (DEBUGGING(LEVELING)) {
+          if (marlin_debug_flags & DEBUG_LEVELING) {
             print_xyz("> homeY", current_position);
           }
         #endif
@@ -2639,32 +2676,29 @@ inline void gcode_G28() {
         #if ENABLED(Z_SAFE_HOMING)
 
           #if ENABLED(DEBUG_LEVELING_FEATURE)
-            if (DEBUGGING(LEVELING)) {
+            if (marlin_debug_flags & DEBUG_LEVELING) {
               SERIAL_ECHOLNPGM("> Z_SAFE_HOMING >>>");
             }
           #endif
 
           if (home_all_axis) {
 
-            /**
-             * At this point we already have Z at MIN_Z_HEIGHT_FOR_HOMING height
-             * No need to move Z any more as this height should already be safe
-             * enough to reach Z_SAFE_HOMING XY positions.
-             * Just make sure the planner is in sync.
-             */
+            // At this point we already have Z at MIN_Z_HEIGHT_FOR_HOMING height
+            // No need to move Z any more as this height should already be safe
+            // enough to reach Z_SAFE_HOMING XY positions.
+            // Just make sure the planner is in sync.
             sync_plan_position();
 
-            /**
-             * Set the Z probe (or just the nozzle) destination to the safe
-             *  homing point
-             */
+            //
+            // Set the Z probe (or just the nozzle) destination to the safe homing point
+            //
             destination[X_AXIS] = round(Z_SAFE_HOMING_X_POINT - (X_PROBE_OFFSET_FROM_EXTRUDER));
             destination[Y_AXIS] = round(Z_SAFE_HOMING_Y_POINT - (Y_PROBE_OFFSET_FROM_EXTRUDER));
             destination[Z_AXIS] = current_position[Z_AXIS]; //z is already at the right height
             feedrate = XY_TRAVEL_SPEED;
 
             #if ENABLED(DEBUG_LEVELING_FEATURE)
-              if (DEBUGGING(LEVELING)) {
+              if (marlin_debug_flags & DEBUG_LEVELING) {
                 print_xyz("> Z_SAFE_HOMING > home_all_axis > current_position", current_position);
                 print_xyz("> Z_SAFE_HOMING > home_all_axis > destination", destination);
               }
@@ -2674,10 +2708,8 @@ inline void gcode_G28() {
             line_to_destination();
             st_synchronize();
 
-            /**
-             * Update the current positions for XY, Z is still at least at
-             * MIN_Z_HEIGHT_FOR_HOMING height, no changes there.
-             */
+            // Update the current positions for XY, Z is still at least at
+            // MIN_Z_HEIGHT_FOR_HOMING height, no changes there.
             current_position[X_AXIS] = destination[X_AXIS];
             current_position[Y_AXIS] = destination[Y_AXIS];
 
@@ -2688,13 +2720,10 @@ inline void gcode_G28() {
           else if (homeZ) { // Don't need to Home Z twice
 
             // Let's see if X and Y are homed
-            if (axis_homed[X_AXIS] && axis_homed[Y_AXIS]) {
+            if (axis_known_position[X_AXIS] && axis_known_position[Y_AXIS]) {
 
-              /**
-               * Make sure the Z probe is within the physical limits
-               * NOTE: This doesn't necessarily ensure the Z probe is also
-               * within the bed!
-               */
+              // Make sure the Z probe is within the physical limits
+              // NOTE: This doesn't necessarily ensure the Z probe is also within the bed!
               float cpx = current_position[X_AXIS], cpy = current_position[Y_AXIS];
               if (   cpx >= X_MIN_POS - (X_PROBE_OFFSET_FROM_EXTRUDER)
                   && cpx <= X_MAX_POS - (X_PROBE_OFFSET_FROM_EXTRUDER)
@@ -2711,13 +2740,42 @@ inline void gcode_G28() {
               }
             }
             else {
-              axis_unhomed_error();
+              unknown_position_error();
             }
 
-          } // !home_all_axes && homeZ
+           } // !home_all_axes && homeZ
+
+                  #if ENABLED(Z_PROBE_TILT) // Additional actions needed when using this
+                
+                // Performs HOMEAXIS(Z) in the middle of the bed
+                
+                      feedrate = XY_TRAVEL_SPEED;
+                      destination[X_AXIS] = (X_MIN_POS + X_MAX_POS) / 2;
+                      destination[Y_AXIS] = (Y_MIN_POS + Y_MAX_POS) / 2;
+                      destination[Z_AXIS] = Z_RAISE_BEFORE_PROBING;
+                      prepare_move();
+                
+                // Gets final Z level in the middle of the bed
+                
+                    HOMEAXIS(Z);
+                
+                // Stows the probe
+                
+                    stow_z_probe();
+                
+                // Moves to 0,0,0 where G28 is supposed to finish
+                
+                    feedrate = XY_TRAVEL_SPEED;
+                    destination[X_AXIS] = 0;
+                    destination[Y_AXIS] = 0;
+                    destination[Z_AXIS] = 0;
+                    prepare_move();
+                    st_synchronize();
+                  
+                  #endif
 
           #if ENABLED(DEBUG_LEVELING_FEATURE)
-            if (DEBUGGING(LEVELING)) {
+            if (marlin_debug_flags & DEBUG_LEVELING) {
               SERIAL_ECHOLNPGM("<<< Z_SAFE_HOMING");
             }
           #endif
@@ -2729,7 +2787,7 @@ inline void gcode_G28() {
         #endif // !Z_SAFE_HOMING
 
         #if ENABLED(DEBUG_LEVELING_FEATURE)
-          if (DEBUGGING(LEVELING)) {
+          if (marlin_debug_flags & DEBUG_LEVELING) {
             print_xyz("> (home_all_axis || homeZ) > final", current_position);
           }
         #endif
@@ -2748,26 +2806,27 @@ inline void gcode_G28() {
 
   #if ENABLED(ENDSTOPS_ONLY_FOR_HOMING)
     #if ENABLED(DEBUG_LEVELING_FEATURE)
-      if (DEBUGGING(LEVELING)) {
+      if (marlin_debug_flags & DEBUG_LEVELING) {
         SERIAL_ECHOLNPGM("ENDSTOPS_ONLY_FOR_HOMING enable_endstops(false)");
       }
     #endif
     enable_endstops(false);
   #endif
 
-  // For mesh leveling move back to Z=0
+  // For manual leveling move back to 0,0
   #if ENABLED(MESH_BED_LEVELING)
-    if (mbl_was_active && home_all_axis) {
+    if (mbl_was_active) {
+      current_position[X_AXIS] = mbl.get_x(0);
+      current_position[Y_AXIS] = mbl.get_y(0);
+      set_destination_to_current();
+      feedrate = homing_feedrate[X_AXIS];
+      line_to_destination();
+      st_synchronize();
       current_position[Z_AXIS] = MESH_HOME_SEARCH_Z;
       sync_plan_position();
       mbl.active = 1;
-      current_position[Z_AXIS] = 0.0;
-      set_destination_to_current();
-      feedrate = homing_feedrate[Z_AXIS];
-      line_to_destination();
-      st_synchronize();
       #if ENABLED(DEBUG_LEVELING_FEATURE)
-        if (DEBUGGING(LEVELING)) {
+        if (marlin_debug_flags & DEBUG_LEVELING) {
           print_xyz("mbl_was_active > current_position", current_position);
         }
       #endif
@@ -2780,9 +2839,9 @@ inline void gcode_G28() {
   endstops_hit_on_purpose(); // clear endstop hit flags
 
   #if ENABLED(DEBUG_LEVELING_FEATURE)
-    if (DEBUGGING(LEVELING)) {
+    if (marlin_debug_flags & DEBUG_LEVELING) {
       SERIAL_ECHOLNPGM("<<< gcode_G28");
-    }
+      }
   #endif
 
   gcode_M114(); // Send end position to RepetierHost
@@ -2791,7 +2850,7 @@ inline void gcode_G28() {
 
 #if ENABLED(MESH_BED_LEVELING)
 
-  enum MeshLevelingState { MeshReport, MeshStart, MeshNext, MeshSet, MeshSetZOffset };
+  enum MeshLevelingState { MeshReport, MeshStart, MeshNext, MeshSet };
 
   /**
    * G29: Mesh-based Z probe, probes a grid and produces a
@@ -2803,22 +2862,21 @@ inline void gcode_G28() {
    *  S1              Start probing mesh points
    *  S2              Probe the next mesh point
    *  S3 Xn Yn Zn.nn  Manually modify a single point
-   *  S4 Zn.nn        Set z offset. Positive away from bed, negative closer to bed.
    *
    * The S0 report the points as below
    *
-   *  +----> X-axis  1-n
+   *  +----> X-axis
    *  |
    *  |
-   *  v Y-axis  1-n
+   *  v Y-axis
    *
    */
   inline void gcode_G29() {
 
     static int probe_point = -1;
     MeshLevelingState state = code_seen('S') ? (MeshLevelingState)code_value_short() : MeshReport;
-    if (state < 0 || state > 4) {
-      SERIAL_PROTOCOLLNPGM("S out of range (0-4).");
+    if (state < 0 || state > 3) {
+      SERIAL_PROTOCOLLNPGM("S out of range (0-3).");
       return;
     }
 
@@ -2834,8 +2892,6 @@ inline void gcode_G28() {
           SERIAL_PROTOCOL(MESH_NUM_Y_POINTS);
           SERIAL_PROTOCOLPGM("\nZ search height: ");
           SERIAL_PROTOCOL(MESH_HOME_SEARCH_Z);
-          SERIAL_PROTOCOLPGM("\nZ offset: ");
-          SERIAL_PROTOCOL_F(mbl.z_offset, 5);
           SERIAL_PROTOCOLLNPGM("\nMeasured points:");
           for (int y = 0; y < MESH_NUM_Y_POINTS; y++) {
             for (int x = 0; x < MESH_NUM_X_POINTS; x++) {
@@ -2926,17 +2982,6 @@ inline void gcode_G28() {
           return;
         }
         mbl.z_values[iy][ix] = z;
-        break;
-
-      case MeshSetZOffset:
-        if (code_seen('Z')) {
-          z = code_value();
-        }
-        else {
-          SERIAL_PROTOCOLPGM("Z not entered.\n");
-          return;
-        }
-        mbl.z_offset = z;
 
     } // switch(state)
   }
@@ -2990,14 +3035,14 @@ inline void gcode_G28() {
   inline void gcode_G29() {
 
     #if ENABLED(DEBUG_LEVELING_FEATURE)
-      if (DEBUGGING(LEVELING)) {
+      if (marlin_debug_flags & DEBUG_LEVELING) {
         SERIAL_ECHOLNPGM("gcode_G29 >>>");
       }
     #endif
 
     // Don't allow auto-leveling without homing first
-    if (!axis_homed[X_AXIS] || !axis_homed[Y_AXIS]) {
-      axis_unhomed_error();
+    if (!axis_known_position[X_AXIS] || !axis_known_position[Y_AXIS]) {
+      unknown_position_error();
       return;
     }
 
@@ -3071,8 +3116,11 @@ inline void gcode_G28() {
 
     #if ENABLED(Z_PROBE_SLED)
       dock_sled(false); // engage (un-dock) the Z probe
-    #elif ENABLED(Z_PROBE_ALLEN_KEY) || (ENABLED(DELTA) && SERVO_LEVELING)
+    #elif ENABLED(Z_PROBE_ALLEN_KEY) //|| SERVO_LEVELING
       deploy_z_probe();
+    #elif ENABLED(Z_PROBE_TILT) 
+      deploy_z_probe();
+      
     #endif
 
     st_synchronize();
@@ -3111,14 +3159,11 @@ inline void gcode_G28() {
         float z_offset = zprobe_zoffset;
         if (code_seen(axis_codes[Z_AXIS])) z_offset += code_value();
       #else // !DELTA
-        /**
-         * solve the plane equation ax + by + d = z
-         * A is the matrix with rows [x y 1] for all the probed points
-         * B is the vector of the Z positions
-         * the normal vector to the plane is formed by the coefficients of the
-         * plane equation in the standard form, which is Vx*x+Vy*y+Vz*z+d = 0
-         * so Vx = -a Vy = -b Vz = 1 (we want the vector facing towards positive Z
-         */
+        // solve the plane equation ax + by + d = z
+        // A is the matrix with rows [x y 1] for all the probed points
+        // B is the vector of the Z positions
+        // the normal vector to the plane is formed by the coefficients of the plane equation in the standard form, which is Vx*x+Vy*y+Vz*z+d = 0
+        // so Vx = -a Vy = -b Vz = 1 (we want the vector facing towards positive Z
 
         int abl2 = auto_bed_leveling_grid_points * auto_bed_leveling_grid_points;
 
@@ -3157,7 +3202,7 @@ inline void gcode_G28() {
 
           if (probePointCounter) {
             #if ENABLED(DEBUG_LEVELING_FEATURE)
-              if (DEBUGGING(LEVELING)) {
+              if (marlin_debug_flags & DEBUG_LEVELING) {
                 SERIAL_ECHOPAIR("z_before = (between) ", (float)(Z_RAISE_BETWEEN_PROBINGS + current_position[Z_AXIS]));
                 SERIAL_EOL;
               }
@@ -3165,7 +3210,7 @@ inline void gcode_G28() {
           }
           else {
             #if ENABLED(DEBUG_LEVELING_FEATURE)
-              if (DEBUGGING(LEVELING)) {
+              if (marlin_debug_flags & DEBUG_LEVELING) {
                 SERIAL_ECHOPAIR("z_before = (before) ", (float)Z_RAISE_BEFORE_PROBING);
                 SERIAL_EOL;
               }
@@ -3210,7 +3255,7 @@ inline void gcode_G28() {
       } //yProbe
 
       #if ENABLED(DEBUG_LEVELING_FEATURE)
-        if (DEBUGGING(LEVELING)) {
+        if (marlin_debug_flags & DEBUG_LEVELING) {
           print_xyz("> probing complete > current_position", current_position);
         }
       #endif
@@ -3316,7 +3361,7 @@ inline void gcode_G28() {
     #else // !AUTO_BED_LEVELING_GRID
 
       #if ENABLED(DEBUG_LEVELING_FEATURE)
-        if (DEBUGGING(LEVELING)) {
+        if (marlin_debug_flags & DEBUG_LEVELING) {
           SERIAL_ECHOLNPGM("> 3-point Leveling");
         }
       #endif
@@ -3339,7 +3384,7 @@ inline void gcode_G28() {
 
     #if ENABLED(DELTA)
       // Allen Key Probe for Delta
-      #if ENABLED(Z_PROBE_ALLEN_KEY) || SERVO_LEVELING
+      #if ENABLED(Z_PROBE_ALLEN_KEY)
         stow_z_probe();
       #elif Z_RAISE_AFTER_PROBING > 0
         raise_z_after_probing(); // ???
@@ -3349,18 +3394,16 @@ inline void gcode_G28() {
         plan_bed_level_matrix.debug(" \n\nBed Level Correction Matrix:");
 
       if (!dryrun) {
-        /**
-         * Correct the Z height difference from Z probe position and nozzle tip position.
-         * The Z height on homing is measured by Z probe, but the Z probe is quite far
-         * from the nozzle. When the bed is uneven, this height must be corrected.
-         */
+        // Correct the Z height difference from Z probe position and nozzle tip position.
+        // The Z height on homing is measured by Z probe, but the Z probe is quite far from the nozzle.
+        // When the bed is uneven, this height must be corrected.
         float x_tmp = current_position[X_AXIS] + X_PROBE_OFFSET_FROM_EXTRUDER,
               y_tmp = current_position[Y_AXIS] + Y_PROBE_OFFSET_FROM_EXTRUDER,
               z_tmp = current_position[Z_AXIS],
               real_z = st_get_axis_position_mm(Z_AXIS);  //get the real Z (since plan_get_position is now correcting the plane)
 
         #if ENABLED(DEBUG_LEVELING_FEATURE)
-          if (DEBUGGING(LEVELING)) {
+          if (marlin_debug_flags & DEBUG_LEVELING) {
             SERIAL_ECHOPAIR("> BEFORE apply_rotation_xyz > z_tmp  = ", z_tmp);
             SERIAL_EOL;
             SERIAL_ECHOPAIR("> BEFORE apply_rotation_xyz > real_z = ", real_z);
@@ -3368,48 +3411,43 @@ inline void gcode_G28() {
           }
         #endif
 
-        // Apply the correction sending the Z probe offset
-        apply_rotation_xyz(plan_bed_level_matrix, x_tmp, y_tmp, z_tmp);
+        apply_rotation_xyz(plan_bed_level_matrix, x_tmp, y_tmp, z_tmp); // Apply the correction sending the Z probe offset
 
-        /*
-         * Get the current Z position and send it to the planner.
-         *
-         * >> (z_tmp - real_z) : The rotated current Z minus the uncorrected Z
-         * (most recent plan_set_position/sync_plan_position)
-         *
-         * >> zprobe_zoffset : Z distance from nozzle to Z probe
-         * (set by default, M851, EEPROM, or Menu)
-         *
-         * >> Z_RAISE_AFTER_PROBING : The distance the Z probe will have lifted
-         * after the last probe
-         *
-         * >> Should home_offset[Z_AXIS] be included?
-         *
-         *
-         *   Discussion: home_offset[Z_AXIS] was applied in G28 to set the
-         *   starting Z. If Z is not tweaked in G29 -and- the Z probe in G29 is
-         *   not actually "homing" Z... then perhaps it should not be included
-         *   here. The purpose of home_offset[] is to adjust for inaccurate
-         *   endstops, not for reasonably accurate probes. If it were added
-         *   here, it could be seen as a compensating factor for the Z probe.
-         */
+        // Get the current Z position and send it to the planner.
+        //
+        // >> (z_tmp - real_z) : The rotated current Z minus the uncorrected Z (most recent plan_set_position/sync_plan_position)
+        //
+        // >> zprobe_zoffset : Z distance from nozzle to Z probe (set by default, M851, EEPROM, or Menu)
+        //
+        // >> Z_RAISE_AFTER_PROBING : The distance the Z probe will have lifted after the last probe
+        //
+        // >> Should home_offset[Z_AXIS] be included?
+        //
+        //      Discussion: home_offset[Z_AXIS] was applied in G28 to set the starting Z.
+        //      If Z is not tweaked in G29 -and- the Z probe in G29 is not actually "homing" Z...
+        //      then perhaps it should not be included here. The purpose of home_offset[] is to
+        //      adjust for inaccurate endstops, not for reasonably accurate probes. If it were
+        //      added here, it could be seen as a compensating factor for the Z probe.
+        //
         #if ENABLED(DEBUG_LEVELING_FEATURE)
-          if (DEBUGGING(LEVELING)) {
+          if (marlin_debug_flags & DEBUG_LEVELING) {
             SERIAL_ECHOPAIR("> AFTER apply_rotation_xyz > z_tmp  = ", z_tmp);
             SERIAL_EOL;
           }
         #endif
 
         current_position[Z_AXIS] = -zprobe_zoffset + (z_tmp - real_z)
-          #if HAS_SERVO_ENDSTOPS || ENABLED(Z_PROBE_ALLEN_KEY) || ENABLED(Z_PROBE_SLED)
+          #if HAS_SERVO_ENDSTOPS || ENABLED(Z_PROBE_ALLEN_KEY) || ENABLED(Z_PROBE_SLED) 
              + Z_RAISE_AFTER_PROBING
+          #elif ENABLED(Z_PROBE_TILT)  
+             + MIN_Z_HEIGHT_FOR_HOMING // this formula matches the real behaviour of the printer, (why¿?) .
           #endif
           ;
         // current_position[Z_AXIS] += home_offset[Z_AXIS]; // The Z probe determines Z=0, not "Z home"
         sync_plan_position();
 
         #if ENABLED(DEBUG_LEVELING_FEATURE)
-          if (DEBUGGING(LEVELING)) {
+          if (marlin_debug_flags & DEBUG_LEVELING) {
             print_xyz("> corrected Z in G29", current_position);
           }
         #endif
@@ -3429,7 +3467,7 @@ inline void gcode_G28() {
 
     #ifdef Z_PROBE_END_SCRIPT
       #if ENABLED(DEBUG_LEVELING_FEATURE)
-        if (DEBUGGING(LEVELING)) {
+        if (marlin_debug_flags & DEBUG_LEVELING) {
           SERIAL_ECHO("Z Probe End Script: ");
           SERIAL_ECHOLNPGM(Z_PROBE_END_SCRIPT);
         }
@@ -3444,7 +3482,7 @@ inline void gcode_G28() {
     KEEPALIVE_STATE(IN_HANDLER);
 
     #if ENABLED(DEBUG_LEVELING_FEATURE)
-      if (DEBUGGING(LEVELING)) {
+      if (marlin_debug_flags & DEBUG_LEVELING) {
         SERIAL_ECHOLNPGM("<<< gcode_G29");
       }
     #endif
@@ -3462,11 +3500,11 @@ inline void gcode_G28() {
       #if HAS_SERVO_ENDSTOPS
         raise_z_for_servo();
       #endif
-      deploy_z_probe(); // Engage Z Servo endstop if available. Z_PROBE_SLED is missed here.
+      deploy_z_probe(); // Engage Z Servo endstop if available. Z_PROBE_SLED is missed her.
 
       st_synchronize();
       // TODO: clear the leveling matrix or the planner will be set incorrectly
-      setup_for_endstop_move(); // Too late. Must be done before deploying.
+      setup_for_endstop_move(); // to late. Must be done before deploying.
 
       feedrate = homing_feedrate[Z_AXIS];
 
@@ -3479,12 +3517,12 @@ inline void gcode_G28() {
       SERIAL_PROTOCOL(current_position[Z_AXIS] + 0.0001);
       SERIAL_EOL;
 
-      clean_up_after_endstop_move(); // Too early. must be done after the stowing.
+      clean_up_after_endstop_move(); // to early. must be done after the stowing.
 
       #if HAS_SERVO_ENDSTOPS
         raise_z_for_servo();
       #endif
-      stow_z_probe(false); // Retract Z Servo endstop if available. Z_PROBE_SLED is missed here.
+      stow_z_probe(false); // Retract Z Servo endstop if available. Z_PROBE_SLED is missed her.
 
       gcode_M114(); // Send end position to RepetierHost
     }
@@ -3701,7 +3739,7 @@ inline void gcode_M31() {
     bool call_procedure = code_seen('P') && (seen_pointer < namestartpos);
 
     if (card.cardOK) {
-      card.openFile(namestartpos, true, call_procedure);
+      card.openFile(namestartpos, true, !call_procedure);
 
       if (code_seen('S') && seen_pointer < namestartpos) // "S" (must occur _before_ the filename!)
         card.setIndex(code_value_short());
@@ -3782,10 +3820,7 @@ inline void gcode_M42() {
 
 #if ENABLED(AUTO_BED_LEVELING_FEATURE) && ENABLED(Z_MIN_PROBE_REPEATABILITY_TEST)
 
-  /**
-   * This is redundant since the SanityCheck.h already checks for a valid
-   *  Z_MIN_PROBE_PIN, but here for clarity.
-   */
+  // This is redundant since the SanityCheck.h already checks for a valid Z_MIN_PROBE_PIN, but here for clarity.
   #if ENABLED(Z_MIN_PROBE_ENDSTOP)
     #if !HAS_Z_PROBE
       #error You must define Z_MIN_PROBE_PIN to enable Z probe repeatability calculation.
@@ -3814,8 +3849,8 @@ inline void gcode_M42() {
    */
   inline void gcode_M48() {
 
-    if (!axis_homed[X_AXIS] || !axis_homed[Y_AXIS] || !axis_homed[Z_AXIS]) {
-      axis_unhomed_error();
+    if (!axis_known_position[X_AXIS] || !axis_known_position[Y_AXIS] || !axis_known_position[Z_AXIS]) {
+      unknown_position_error();
       return;
     }
 
@@ -3892,20 +3927,17 @@ inline void gcode_M42() {
       if (!seen_L) n_legs = 7;
     }
 
-    /**
-     * Now get everything to the specified probe point So we can safely do a
-     * probe to get us close to the bed.  If the Z-Axis is far from the bed,
-     * we don't want to use that as a starting point for each probe.
-     */
+    // Now get everything to the specified probe point So we can safely do a probe to
+    // get us close to the bed.  If the Z-Axis is far from the bed, we don't want to
+    // use that as a starting point for each probe.
+    //
     if (verbose_level > 2)
       SERIAL_PROTOCOLPGM("Positioning the probe...\n");
 
     #if ENABLED(DELTA)
-      // we don't do bed level correction in M48 because we want the raw data when we probe
-      reset_bed_level();
+      reset_bed_level();    // we don't do bed level correction in M48 because we want the raw data when we probe
     #else
-      // we don't do bed level correction in M48 because we want the raw data when we probe
-      plan_bed_level_matrix.set_to_identity();
+      plan_bed_level_matrix.set_to_identity();  // we don't do bed level correction in M48 because we wantthe raw data when we probe
     #endif
 
     if (Z_start_location < Z_RAISE_BEFORE_PROBING * 2.0)
@@ -3913,10 +3945,10 @@ inline void gcode_M42() {
 
     do_blocking_move_to_xy(X_probe_location - X_PROBE_OFFSET_FROM_EXTRUDER, Y_probe_location - Y_PROBE_OFFSET_FROM_EXTRUDER);
 
-    /**
-     * OK, do the initial probe to get us close to the bed.
-     * Then retrace the right amount and use that in subsequent probes
-     */
+    //
+    // OK, do the initial probe to get us close to the bed.
+    // Then retrace the right amount and use that in subsequent probes
+    //
     setup_for_endstop_move();
 
     probe_pt(X_probe_location, Y_probe_location, Z_RAISE_BEFORE_PROBING,
@@ -3953,27 +3985,19 @@ inline void gcode_M42() {
 
         for (uint8_t l = 0; l < n_legs - 1; l++) {
           double delta_angle;
-
           if (schizoid_flag)
-            // The points of a 5 point star are 72 degrees apart.  We need to
-            // skip a point and go to the next one on the star.
-            delta_angle = dir * 2.0 * 72.0;
-
+            delta_angle = dir * 2.0 * 72.0;   // The points of a 5 point star are 72 degrees apart.  We need to
+          // skip a point and go to the next one on the star.
           else
-            // If we do this line, we are just trying to move further
-            // around the circle.
-            delta_angle = dir * (float) random(25, 45);
-
+            delta_angle = dir * (float) random(25, 45);   // If we do this line, we are just trying to move further
+          // around the circle.
           angle += delta_angle;
-
           while (angle > 360.0)   // We probably do not need to keep the angle between 0 and 2*PI, but the
             angle -= 360.0;       // Arduino documentation says the trig functions should not be given values
           while (angle < 0.0)     // outside of this range.   It looks like they behave correctly with
             angle += 360.0;       // numbers outside of the range, but just to be safe we clamp them.
-
           X_current = X_probe_location - X_PROBE_OFFSET_FROM_EXTRUDER + cos(RADIANS(angle)) * radius;
           Y_current = Y_probe_location - Y_PROBE_OFFSET_FROM_EXTRUDER + sin(RADIANS(angle)) * radius;
-
           #if DISABLED(DELTA)
             X_current = constrain(X_current, X_MIN_POS, X_MAX_POS);
             Y_current = constrain(Y_current, Y_MIN_POS, Y_MAX_POS);
@@ -4003,13 +4027,10 @@ inline void gcode_M42() {
         } // n_legs loop
       } // n_legs
 
-      /**
-       * We don't really have to do this move, but if we don't we can see a
-       * funny shift in the Z Height because the user might not have the
-       * Z_RAISE_BEFORE_PROBING height identical to the Z_RAISE_BETWEEN_PROBING
-       * height. This gets us back to the probe location at the same height that
-       * we have been running around the circle at.
-       */
+      // We don't really have to do this move, but if we don't we can see a funny shift in the Z Height
+      // Because the user might not have the Z_RAISE_BEFORE_PROBING height identical to the
+      // Z_RAISE_BETWEEN_PROBING height.  This gets us back to the probe location at the same height that
+      // we have been running around the circle at.
       do_blocking_move_to_xy(X_probe_location - X_PROBE_OFFSET_FROM_EXTRUDER, Y_probe_location - Y_PROBE_OFFSET_FROM_EXTRUDER);
       if (deploy_probe_for_each_reading)
         sample_set[n] = probe_pt(X_probe_location, Y_probe_location, Z_RAISE_BEFORE_PROBING, ProbeDeployAndStow, verbose_level);
@@ -4019,17 +4040,17 @@ inline void gcode_M42() {
           sample_set[n] = probe_pt(X_probe_location, Y_probe_location, Z_RAISE_BEFORE_PROBING, ProbeStay, verbose_level);
       }
 
-      /**
-       * Get the current mean for the data points we have so far
-       */
+      //
+      // Get the current mean for the data points we have so far
+      //
       sum = 0.0;
       for (uint8_t j = 0; j <= n; j++) sum += sample_set[j];
       mean = sum / (n + 1);
 
-      /**
-       * Now, use that mean to calculate the standard deviation for the
-       * data points we have so far
-       */
+      //
+      // Now, use that mean to calculate the standard deviation for the
+      // data points we have so far
+      //
       sum = 0.0;
       for (uint8_t j = 0; j <= n; j++) {
         float ss = sample_set[j] - mean;
@@ -4081,10 +4102,7 @@ inline void gcode_M42() {
  */
 inline void gcode_M104() {
   if (setTargetedHotend(104)) return;
-  if (DEBUGGING(DRYRUN)) return;
-
-  // Start hook must happen before setTargetHotend()
-  print_job_start();
+  if (marlin_debug_flags & DEBUG_DRYRUN) return;
 
   if (code_seen('S')) {
     float temp = code_value();
@@ -4093,11 +4111,9 @@ inline void gcode_M104() {
       if (dual_x_carriage_mode == DXC_DUPLICATION_MODE && target_extruder == 0)
         setTargetHotend1(temp == 0.0 ? 0.0 : temp + duplicate_extruder_temp_offset);
     #endif
-
-    if (temp > degHotend(target_extruder)) LCD_MESSAGEPGM(MSG_HEATING);
   }
 
-  if (print_job_stop()) LCD_MESSAGEPGM(WELCOME_MSG);
+  print_job_stop();
 }
 
 #if HAS_TEMP_0 || HAS_TEMP_BED || ENABLED(HEATER_0_USES_MAX6675)
@@ -4222,11 +4238,11 @@ inline void gcode_M105() {
 inline void gcode_M109() {
   bool no_wait_for_cooling = true;
 
-  if (setTargetedHotend(109)) return;
-  if (DEBUGGING(DRYRUN)) return;
-
   // Start hook must happen before setTargetHotend()
   print_job_start();
+
+  if (setTargetedHotend(109)) return;
+  if (marlin_debug_flags & DEBUG_DRYRUN) return;
 
   no_wait_for_cooling = code_seen('S');
   if (no_wait_for_cooling || code_seen('R')) {
@@ -4262,7 +4278,7 @@ inline void gcode_M109() {
     #define TEMP_CONDITIONS (residency_start_ms < 0 || now < residency_start_ms + (TEMP_RESIDENCY_TIME) * 1000UL)
   #else
     // Loop until the temperature is very close target
-    #define TEMP_CONDITIONS (isHeatingHotend(target_extruder))
+    #define TEMP_CONDITIONS (fabs(degHotend(target_extruder) - degTargetHotend(target_extruder)) < 0.75f)
   #endif //TEMP_RESIDENCY_TIME
 
   cancel_heatup = false;
@@ -4310,7 +4326,7 @@ inline void gcode_M109() {
    *       Rxxx Wait for bed current temp to reach target temp. Waits when heating and cooling
    */
   inline void gcode_M190() {
-    if (DEBUGGING(DRYRUN)) return;
+    if (marlin_debug_flags & DEBUG_DRYRUN) return;
 
     LCD_MESSAGEPGM(MSG_BED_HEATING);
     bool no_wait_for_cooling = code_seen('S');
@@ -4322,7 +4338,7 @@ inline void gcode_M109() {
 
     cancel_heatup = false;
     millis_t now = millis(), next_temp_ms = now + 1000UL;
-    while (!cancel_heatup && isHeatingBed()) {
+    while (!cancel_heatup && degTargetBed() != degBed()) {
       millis_t now = millis();
       if (now > next_temp_ms) { //Print Temp Reading every 1 second while heating up.
         next_temp_ms = now + 1000UL;
@@ -4348,39 +4364,27 @@ inline void gcode_M110() {
  * M111: Set the debug level
  */
 inline void gcode_M111() {
-  marlin_debug_flags = code_seen('S') ? code_value_short() : DEBUG_NONE;
+  marlin_debug_flags = code_seen('S') ? code_value_short() : DEBUG_INFO | DEBUG_COMMUNICATION;
 
-  const char str_debug_1[] PROGMEM = MSG_DEBUG_ECHO;
-  const char str_debug_2[] PROGMEM = MSG_DEBUG_INFO;
-  const char str_debug_4[] PROGMEM = MSG_DEBUG_ERRORS;
-  const char str_debug_8[] PROGMEM = MSG_DEBUG_DRYRUN;
-  const char str_debug_16[] PROGMEM = MSG_DEBUG_COMMUNICATION;
+  if (marlin_debug_flags & DEBUG_ECHO) {
+    SERIAL_ECHO_START;
+    SERIAL_ECHOLNPGM(MSG_DEBUG_ECHO);
+  }
+  // FOR MOMENT NOT ACTIVE
+  //if (marlin_debug_flags & DEBUG_INFO) SERIAL_ECHOLNPGM(MSG_DEBUG_INFO);
+  //if (marlin_debug_flags & DEBUG_ERRORS) SERIAL_ECHOLNPGM(MSG_DEBUG_ERRORS);
+  if (marlin_debug_flags & DEBUG_DRYRUN) {
+    SERIAL_ECHO_START;
+    SERIAL_ECHOLNPGM(MSG_DEBUG_DRYRUN);
+    disable_all_heaters();
+  }
+
   #if ENABLED(DEBUG_LEVELING_FEATURE)
-    const char str_debug_32[] PROGMEM = MSG_DEBUG_LEVELING;
-  #endif
-
-  const char* const debug_strings[] PROGMEM = {
-    str_debug_1, str_debug_2, str_debug_4, str_debug_8, str_debug_16,
-    #if ENABLED(DEBUG_LEVELING_FEATURE)
-      str_debug_32
-    #endif
-  };
-
-  SERIAL_ECHO_START;
-  SERIAL_ECHOPGM(MSG_DEBUG_PREFIX);
-  if (marlin_debug_flags) {
-    uint8_t comma = 0;
-    for (uint8_t i = 0; i < COUNT(debug_strings); i++) {
-      if (TEST(marlin_debug_flags, i)) {
-        if (comma++) SERIAL_CHAR('|');
-        serialprintPGM(debug_strings[i]);
-      }
+    if (marlin_debug_flags & DEBUG_LEVELING) {
+      SERIAL_ECHO_START;
+      SERIAL_ECHOLNPGM(MSG_DEBUG_LEVELING);
     }
-  }
-  else {
-    SERIAL_ECHOPGM(MSG_DEBUG_OFF);
-  }
-  SERIAL_EOL;
+  #endif
 }
 
 /**
@@ -4418,7 +4422,7 @@ inline void gcode_M112() { kill(PSTR(MSG_KILLED)); }
  * M140: Set bed temperature
  */
 inline void gcode_M140() {
-  if (DEBUGGING(DRYRUN)) return;
+  if (marlin_debug_flags & DEBUG_DRYRUN) return;
   if (code_seen('S')) setTargetBed(code_value());
 }
 
@@ -4486,11 +4490,9 @@ inline void gcode_M140() {
   inline void gcode_M80() {
     OUT_WRITE(PS_ON_PIN, PS_ON_AWAKE); //GND
 
-    /**
-     * If you have a switch on suicide pin, this is useful
-     * if you want to start another print with suicide feature after
-     * a print without suicide...
-     */
+    // If you have a switch on suicide pin, this is useful
+    // if you want to start another print with suicide feature after
+    // a print without suicide...
     #if HAS_SUICIDE
       OUT_WRITE(SUICIDE_PIN, HIGH);
     #endif
@@ -4902,7 +4904,7 @@ inline void gcode_M206() {
    */
   inline void gcode_M666() {
     #if ENABLED(DEBUG_LEVELING_FEATURE)
-      if (DEBUGGING(LEVELING)) {
+      if (marlin_debug_flags & DEBUG_LEVELING) {
         SERIAL_ECHOLNPGM(">>> gcode_M666");
       }
     #endif
@@ -4910,7 +4912,7 @@ inline void gcode_M206() {
       if (code_seen(axis_codes[i])) {
         endstop_adj[i] = code_value();
         #if ENABLED(DEBUG_LEVELING_FEATURE)
-          if (DEBUGGING(LEVELING)) {
+          if (marlin_debug_flags & DEBUG_LEVELING) {
             SERIAL_ECHOPGM("endstop_adj[");
             SERIAL_ECHO(axis_codes[i]);
             SERIAL_ECHOPAIR("] = ", endstop_adj[i]);
@@ -4920,7 +4922,7 @@ inline void gcode_M206() {
       }
     }
     #if ENABLED(DEBUG_LEVELING_FEATURE)
-      if (DEBUGGING(LEVELING)) {
+      if (marlin_debug_flags & DEBUG_LEVELING) {
         SERIAL_ECHOLNPGM("<<< gcode_M666");
       }
     #endif
@@ -5451,19 +5453,21 @@ inline void gcode_M400() { st_synchronize(); }
 
 #endif // AUTO_BED_LEVELING_FEATURE && (HAS_SERVO_ENDSTOPS || Z_PROBE_ALLEN_KEY) && !Z_PROBE_SLED
 
-#if ENABLED(FILAMENT_WIDTH_SENSOR)
+#if ENABLED(FILAMENT_SENSOR)
 
   /**
    * M404: Display or set the nominal filament width (3mm, 1.75mm ) W<3.0>
    */
   inline void gcode_M404() {
-    if (code_seen('W')) {
-      filament_width_nominal = code_value();
-    }
-    else {
-      SERIAL_PROTOCOLPGM("Filament dia (nominal mm):");
-      SERIAL_PROTOCOLLN(filament_width_nominal);
-    }
+    #if HAS_FILWIDTH
+      if (code_seen('W')) {
+        filament_width_nominal = code_value();
+      }
+      else {
+        SERIAL_PROTOCOLPGM("Filament dia (nominal mm):");
+        SERIAL_PROTOCOLLN(filament_width_nominal);
+      }
+    #endif
   }
 
   /**
@@ -5476,7 +5480,7 @@ inline void gcode_M400() { st_synchronize(); }
     if (delay_index2 == -1) { //initialize the ring buffer if it has not been done since startup
       int temp_ratio = widthFil_to_size_ratio();
 
-      for (delay_index1 = 0; delay_index1 < COUNT(measurement_delay); ++delay_index1)
+      for (delay_index1 = 0; delay_index1 < MAX_MEASUREMENT_DELAY + 1; ++delay_index1)
         measurement_delay[delay_index1] = temp_ratio - 100;  //subtract 100 to scale within a signed byte
 
       delay_index1 = delay_index2 = 0;
@@ -5503,7 +5507,7 @@ inline void gcode_M400() { st_synchronize(); }
     SERIAL_PROTOCOLLN(filament_width_meas);
   }
 
-#endif // FILAMENT_WIDTH_SENSOR
+#endif // FILAMENT_SENSOR
 
 /**
  * M410: Quickstop - Abort all planned moves
@@ -5565,7 +5569,7 @@ inline void gcode_M428() {
   memcpy(new_pos, current_position, sizeof(new_pos));
   memcpy(new_offs, home_offset, sizeof(new_offs));
   for (int8_t i = X_AXIS; i <= Z_AXIS; i++) {
-    if (axis_homed[i]) {
+    if (axis_known_position[i]) {
       float base = (new_pos[i] > (min_pos[i] + max_pos[i]) / 2) ? base_home_pos(i) : 0,
             diff = new_pos[i] - base;
       if (diff > -20 && diff < 20) {
@@ -5863,13 +5867,13 @@ inline void gcode_M907() {
     if (code_seen('B')) digipot_current(4, code_value());
     if (code_seen('S')) for (int i = 0; i <= 4; i++) digipot_current(i, code_value());
   #endif
-  #if PIN_EXISTS(MOTOR_CURRENT_PWM_XY)
+  #ifdef MOTOR_CURRENT_PWM_XY_PIN
     if (code_seen('X')) digipot_current(0, code_value());
   #endif
-  #if PIN_EXISTS(MOTOR_CURRENT_PWM_Z)
+  #ifdef MOTOR_CURRENT_PWM_Z_PIN
     if (code_seen('Z')) digipot_current(1, code_value());
   #endif
-  #if PIN_EXISTS(MOTOR_CURRENT_PWM_E)
+  #ifdef MOTOR_CURRENT_PWM_E_PIN
     if (code_seen('E')) digipot_current(2, code_value());
   #endif
   #if ENABLED(DIGIPOT_I2C)
@@ -6081,7 +6085,7 @@ inline void gcode_T(uint8_t tmp_extruder) {
 void process_next_command() {
   current_command = command_queue[cmd_queue_index_r];
 
-  if (DEBUGGING(ECHO)) {
+  if ((marlin_debug_flags & DEBUG_ECHO)) {
     SERIAL_ECHO_START;
     SERIAL_ECHOLN(current_command);
   }
@@ -6091,39 +6095,36 @@ void process_next_command() {
   //  - Bypass N[-0-9][0-9]*[ ]*
   //  - Overwrite * with nul to mark the end
   while (*current_command == ' ') ++current_command;
-  if (*current_command == 'N' && NUMERIC_SIGNED(current_command[1])) {
+  if (*current_command == 'N' && ((current_command[1] >= '0' && current_command[1] <= '9') || current_command[1] == '-')) {
     current_command += 2; // skip N[-0-9]
-    while (NUMERIC(*current_command)) ++current_command; // skip [0-9]*
+    while (*current_command >= '0' && *current_command <= '9') ++current_command; // skip [0-9]*
     while (*current_command == ' ') ++current_command; // skip [ ]*
   }
   char* starpos = strchr(current_command, '*');  // * should always be the last parameter
   if (starpos) while (*starpos == ' ' || *starpos == '*') *starpos-- = '\0'; // nullify '*' and ' '
 
-  char *cmd_ptr = current_command;
-
   // Get the command code, which must be G, M, or T
-  char command_code = *cmd_ptr++;
+  char command_code = *current_command;
 
-  // Skip spaces to get the numeric part
-  while (*cmd_ptr == ' ') cmd_ptr++;
+  // Skip the letter-code and spaces to get the numeric part
+  current_command_args = current_command + 1;
+  while (*current_command_args == ' ') ++current_command_args;
 
-  uint16_t codenum = 0; // define ahead of goto
+  // The code must have a numeric value
+  bool code_is_good = (*current_command_args >= '0' && *current_command_args <= '9');
+
+  int codenum; // define ahead of goto
 
   // Bail early if there's no code
-  bool code_is_good = NUMERIC(*cmd_ptr);
   if (!code_is_good) goto ExitUnknownCommand;
 
-  // Get and skip the code number
-  do {
-    codenum = (codenum * 10) + (*cmd_ptr - '0');
-    cmd_ptr++;
-  } while (NUMERIC(*cmd_ptr));
+  // Args pointer optimizes code_seen, especially those taking XYZEF
+  // This wastes a little cpu on commands that expect no arguments.
+  while (*current_command_args == ' ' || (*current_command_args >= '0' && *current_command_args <= '9')) ++current_command_args;
 
-  // Skip all spaces to get to the first argument, or nul
-  while (*cmd_ptr == ' ') cmd_ptr++;
-
-  // The command's arguments (if any) start here, for sure!
-  current_command_args = cmd_ptr;
+  // Interpret the code int
+  seen_pointer = current_command;
+  codenum = code_value_short();
 
   KEEPALIVE_STATE(IN_HANDLER);
 
@@ -6545,7 +6546,7 @@ void process_next_command() {
           break;
       #endif // AUTO_BED_LEVELING_FEATURE && (HAS_SERVO_ENDSTOPS || Z_PROBE_ALLEN_KEY) && !Z_PROBE_SLED
 
-      #if ENABLED(FILAMENT_WIDTH_SENSOR)
+      #if ENABLED(FILAMENT_SENSOR)
         case 404:  //M404 Enter the nominal filament width (3mm, 1.75mm ) N<3.0> or display nominal filament width
           gcode_M404();
           break;
@@ -6558,7 +6559,7 @@ void process_next_command() {
         case 407:   //M407 Display measured filament diameter
           gcode_M407();
           break;
-      #endif // ENABLED(FILAMENT_WIDTH_SENSOR)
+      #endif // FILAMENT_SENSOR
 
       case 410: // M410 quickstop - Abort all the planned moves.
         gcode_M410();
@@ -6690,7 +6691,7 @@ void ok_to_send() {
     if (*p == 'N') {
       SERIAL_PROTOCOL(' ');
       SERIAL_ECHO(*p++);
-      while (NUMERIC_SIGNED(*p))
+      while ((*p >= '0' && *p <= '9') || *p == '-')
         SERIAL_ECHO(*p++);
     }
     SERIAL_PROTOCOLPGM(" P"); SERIAL_PROTOCOL(int(BLOCK_BUFFER_SIZE - movesplanned() - 1));
@@ -6709,7 +6710,7 @@ void clamp_to_software_endstops(float target[3]) {
       if (zprobe_zoffset < 0) negative_z_offset += zprobe_zoffset;
       if (home_offset[Z_AXIS] < 0) {
         #if ENABLED(DEBUG_LEVELING_FEATURE)
-          if (DEBUGGING(LEVELING)) {
+          if (marlin_debug_flags & DEBUG_LEVELING) {
             SERIAL_ECHOPAIR("> clamp_to_software_endstops > Add home_offset[Z_AXIS]:", home_offset[Z_AXIS]);
             SERIAL_EOL;
           }
@@ -6889,7 +6890,7 @@ void mesh_plan_buffer_line(float x, float y, float z, const float e, float feed_
 #if ENABLED(PREVENT_DANGEROUS_EXTRUDE)
 
   inline void prevent_dangerous_extrude(float& curr_e, float& dest_e) {
-    if (DEBUGGING(DRYRUN)) return;
+    if (marlin_debug_flags & DEBUG_DRYRUN) return;
     float de = dest_e - curr_e;
     if (de) {
       if (degHotend(active_extruder) < extrude_min_temp) {
@@ -7089,32 +7090,31 @@ void plan_arc(
   float linear_per_segment = linear_travel / segments;
   float extruder_per_segment = extruder_travel / segments;
 
-  /**
-   * Vector rotation by transformation matrix: r is the original vector, r_T is the rotated vector,
-   * and phi is the angle of rotation. Based on the solution approach by Jens Geisler.
-   *     r_T = [cos(phi) -sin(phi);
-   *            sin(phi)  cos(phi] * r ;
-   *
-   * For arc generation, the center of the circle is the axis of rotation and the radius vector is
-   * defined from the circle center to the initial position. Each line segment is formed by successive
-   * vector rotations. This requires only two cos() and sin() computations to form the rotation
-   * matrix for the duration of the entire arc. Error may accumulate from numerical round-off, since
-   * all double numbers are single precision on the Arduino. (True double precision will not have
-   * round off issues for CNC applications.) Single precision error can accumulate to be greater than
-   * tool precision in some cases. Therefore, arc path correction is implemented.
-   *
-   * Small angle approximation may be used to reduce computation overhead further. This approximation
-   * holds for everything, but very small circles and large MM_PER_ARC_SEGMENT values. In other words,
-   * theta_per_segment would need to be greater than 0.1 rad and N_ARC_CORRECTION would need to be large
-   * to cause an appreciable drift error. N_ARC_CORRECTION~=25 is more than small enough to correct for
-   * numerical drift error. N_ARC_CORRECTION may be on the order a hundred(s) before error becomes an
-   * issue for CNC machines with the single precision Arduino calculations.
-   *
-   * This approximation also allows plan_arc to immediately insert a line segment into the planner
-   * without the initial overhead of computing cos() or sin(). By the time the arc needs to be applied
-   * a correction, the planner should have caught up to the lag caused by the initial plan_arc overhead.
-   * This is important when there are successive arc motions.
-   */
+  /* Vector rotation by transformation matrix: r is the original vector, r_T is the rotated vector,
+     and phi is the angle of rotation. Based on the solution approach by Jens Geisler.
+         r_T = [cos(phi) -sin(phi);
+                sin(phi)  cos(phi] * r ;
+
+     For arc generation, the center of the circle is the axis of rotation and the radius vector is
+     defined from the circle center to the initial position. Each line segment is formed by successive
+     vector rotations. This requires only two cos() and sin() computations to form the rotation
+     matrix for the duration of the entire arc. Error may accumulate from numerical round-off, since
+     all double numbers are single precision on the Arduino. (True double precision will not have
+     round off issues for CNC applications.) Single precision error can accumulate to be greater than
+     tool precision in some cases. Therefore, arc path correction is implemented.
+
+     Small angle approximation may be used to reduce computation overhead further. This approximation
+     holds for everything, but very small circles and large MM_PER_ARC_SEGMENT values. In other words,
+     theta_per_segment would need to be greater than 0.1 rad and N_ARC_CORRECTION would need to be large
+     to cause an appreciable drift error. N_ARC_CORRECTION~=25 is more than small enough to correct for
+     numerical drift error. N_ARC_CORRECTION may be on the order a hundred(s) before error becomes an
+     issue for CNC machines with the single precision Arduino calculations.
+
+     This approximation also allows plan_arc to immediately insert a line segment into the planner
+     without the initial overhead of computing cos() or sin(). By the time the arc needs to be applied
+     a correction, the planner should have caught up to the lag caused by the initial plan_arc overhead.
+     This is important when there are successive arc motions.
+  */
   // Vector rotation matrix values
   float cos_T = 1 - 0.5 * theta_per_segment * theta_per_segment; // Small angle approximation
   float sin_T = theta_per_segment;
@@ -7387,7 +7387,7 @@ void manage_inactivity(bool ignore_stepper_queue/*=false*/) {
       filrunout();
   #endif
 
-  if (commands_in_queue < BUFSIZE) get_available_commands();
+  if (commands_in_queue < BUFSIZE) get_command();
 
   millis_t ms = millis();
 
@@ -7699,6 +7699,17 @@ bool print_job_start(millis_t t /* = 0 */) {
 }
 
 /**
+ * Output the print job timer in seconds
+ *
+ * @return the number of seconds
+ */
+millis_t print_job_timer() {
+  if (!print_job_start_ms) return 0;
+  return (((print_job_stop_ms > print_job_start_ms)
+    ? print_job_stop_ms : millis()) - print_job_start_ms) / 1000;
+}
+
+/**
  * Check if the running print job has finished and stop the timer
  *
  * When the target temperature for all extruders is zero then we assume that the
@@ -7715,15 +7726,4 @@ bool print_job_stop(bool force /* = false */) {
   if (!force) for (int i = 0; i < EXTRUDERS; i++) if (degTargetHotend(i) > 0) return false;
   print_job_stop_ms = millis();
   return true;
-}
-
-/**
- * Output the print job timer in seconds
- *
- * @return the number of seconds
- */
-millis_t print_job_timer() {
-  if (!print_job_start_ms) return 0;
-  return (((print_job_stop_ms > print_job_start_ms)
-    ? print_job_stop_ms : millis()) - print_job_start_ms) / 1000;
 }
